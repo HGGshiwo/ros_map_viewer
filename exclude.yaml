@@ -1,0 +1,3 @@
+# 录制时排除的话题列表
+exclude_topics:
+  - /loc_map

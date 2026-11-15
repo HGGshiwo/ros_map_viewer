@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>move_base / TEB 路径可视化</title>
+<link rel="stylesheet" href="/static/leaflet.css">
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#111;color:#ddd;
+    font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+    overflow:hidden;-webkit-user-select:none;user-select:none;}
+  #map{position:absolute;top:0;left:0;width:100%;height:100%;background:#1a1a1a;}
+  #ov{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:800;}
+  #panel{position:absolute;top:0;left:0;right:0;z-index:1000;background:rgba(0,0,0,.78);
+    border-bottom:1px solid #333;padding:8px 10px;font-size:13px;line-height:1.5;
+    backdrop-filter:blur(4px);}
+  #panel-head{display:flex;align-items:center;gap:10px;margin-top:6px;}
+  #chips{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;}
+  .chip{background:rgba(255,255,255,.06);border-radius:8px;padding:2px 10px;
+    font-size:12px;color:#ccc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .chip b{color:#fff;font-weight:normal;}
+  .legend{display:flex;gap:10px;font-size:12px;margin-top:6px;}
+  .legend span::before{content:"";display:inline-block;width:14px;height:3px;margin-right:4px;
+    vertical-align:middle;border-radius:2px;}
+  .lg-g::before{background:#4caf50;}
+  .lg-l::before{background:#ff9800;}
+  .lg-t::before{background:#e91e63;}
+  #panel-head button{background:rgba(0,0,0,.5);border:1px solid #333;color:#4fc3f7;
+    border-radius:8px;padding:4px 10px;font-size:13px;cursor:pointer;white-space:nowrap;}
+  #b-rec{color:#ff5252!important;}
+  #modal-bg{position:absolute;inset:0;z-index:2000;background:rgba(0,0,0,.6);
+    display:none;align-items:center;justify-content:center;}
+  #modal{background:#1e1e1e;border:1px solid #444;border-radius:12px;padding:16px;
+    min-width:240px;max-width:80vw;}
+  #modal h4{margin:0 0 12px;color:#4fc3f7;font-size:15px;}
+  #modal button{display:block;width:100%;margin:8px 0;padding:10px;border-radius:10px;
+    background:rgba(255,255,255,.06);border:1px solid #444;color:#4fc3f7;font-size:14px;
+    cursor:pointer;}
+  #s-logs{margin-top:6px;height:120px;overflow:auto;border:1px solid #2a2a2a;border-radius:8px;
+    background:rgba(0,0,0,.45);padding:4px 8px;font-size:11px;}
+  #s-logs .line{white-space:pre;margin-bottom:1px;}
+  .legend{display:flex;gap:10px;flex-wrap:wrap;margin-top:6px;font-size:12px;}
+  .legend span::before{content:"";display:inline-block;width:14px;height:3px;margin-right:4px;
+    vertical-align:middle;border-radius:2px;}
+  .lg-g::before{background:#4caf50;}
+  .lg-l::before{background:#ff9800;}
+  .lg-t::before{background:#e91e63;}
+  #btns{position:absolute;bottom:14px;right:14px;display:flex;flex-direction:column;gap:8px;z-index:1000;}
+  #btns button{background:rgba(0,0,0,.75);border:1px solid #444;color:#ddd;border-radius:10px;
+    padding:10px 12px;font-size:14px;cursor:pointer;}
+  #btns button.on{color:#4fc3f7;border-color:#4fc3f7;}
+  #conn{position:absolute;bottom:14px;left:14px;font-size:12px;color:#777;z-index:1000;}
+  #leaflet-logo{display:none!important;}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<canvas id="ov"></canvas>
+<div id="panel">
+  <div id="chips">
+    <span class="chip">状态 <b id="s-status">--</b></span>
+    <span class="chip">目标 <b id="s-goal">--</b></span>
+    <span class="chip">位姿 <b id="s-pose">--</b></span>
+  </div>
+  <div class="legend">
+    <span class="lg-g">全局路径</span><span class="lg-l">局部路径</span>
+    <span class="lg-t">TEB 轨迹</span>
+  </div>
+  <div id="panel-head">
+    <button id="b-nav">导航点 ▸</button>
+    <button id="b-rec">● 开始录制</button>
+    <button id="collapse">收起 ▲</button>
+  </div>
+  <div id="s-logs"></div>
+</div>
+<div id="modal-bg">
+  <div id="modal">
+    <h4>选择导航目标</h4>
+    <div id="modal-btns"></div>
+    <button id="modal-close" style="color:#999">取消</button>
+  </div>
+</div>
+<div id="btns">
+  <button id="b-follow">跟随机器人</button>
+  <button id="b-cg">全局costmap</button>
+  <button id="b-cl">局部costmap</button>
+  <button id="b-center">重置视图</button>
+</div>
+<div id="conn">等待地图… (v4)</div>
+<script src="/static/leaflet.js"></script>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const DBG = (...a) => console.log('%c[dbg]', 'color:#0af;font-weight:bold', ...a);
+console.log('[ros_map_viewer] frontend version: tiles-v4');
+
+// 全局错误捕获：任何未处理异常都会显示在左下角状态栏 + console
+window.onerror = (msg, src, line, col, err) => {
+  DBG('JS错误:', msg, '@', src + ':' + line + ':' + col, err && err.stack);
+  const c = $('conn');
+  if (c) c.textContent = 'JS错误: ' + msg;
+};
+window.addEventListener('unhandledrejection', e => {
+  DBG('未处理的Promise错误:', e.reason);
+});
+
+// ---------------- Leaflet 初始化（坐标系: 格子, x右 y上） ----------------
+const map = L.map('map', {
+  crs: L.CRS.Simple, minZoom: -3, maxZoom: 5, zoomSnap: 0.25,
+  zoomControl: false, attributionControl: false, inertia: true,
+});
+map.setView([0, 0], -2);
+
+DBG('Leaflet版本:', L.version, '| 容器尺寸:', map.getSize().toString(), '| L存在:', typeof L !== 'undefined');
+setTimeout(() => DBG('100ms后容器尺寸:', map.getSize().toString()), 100);
+
+// 关键事件留档
+map.on('layeradd', e => DBG('图层挂载:', e.layer._url || e.layer.getType()));
+['zoomstart', 'zoomend'].forEach(ev =>
+  map.on(ev, () => DBG('map[' + ev + '] zoom=' + map.getZoom())));
+
+const tileLayers = {};     // name → L.TileLayer
+const layerMeta = {};      // name → {res,ox,oy,w,h,ver}
+let curVers = {};          // name → 当前已挂载的版本
+
+function makeTileLayer(name, m) {
+  const tl = L.tileLayer('/tile/' + name + '/{z}/{x}/{y}.png?v=' + m.ver + '_r7', {
+    tileSize: 256,
+    minZoom: -4,          // 关键修复：必须 ≤ 地图缩放级，否则图层直接不加载任何瓦片
+    maxZoom: 6,
+    minNativeZoom: 0, maxNativeZoom: 0,
+    bounds: [[0, 0], [m.h, m.w]], noWrap: true, updateWhenIdle: true, keepBuffer: 1,
+  });
+  let failed = 0;
+  tl.on('tileerror', e => { failed++; DBG(name, 'tile加载失败:', e.tile.src, failed); });
+  tl.on('load', () => DBG(name, '视口瓦片就绪'));
+  return tl;
+}
+
+async function refreshLayout() {
+  let lay;
+  try {
+    const resp = await fetch('/layout');
+    lay = await resp.json();
+    DBG('/layout 返回:', JSON.stringify(lay));
+  } catch (e) { DBG('/layout 请求失败:', e); return; }
+  for (const name of ['map', 'cg', 'cl']) {
+    const m = lay[name];
+    if (!m) { DBG(name, '图层不存在于layout, 跳过'); continue; }
+    layerMeta[name] = m;
+    if (!tileLayers[name] || curVers[name] !== m.ver) {
+      if (tileLayers[name]) map.removeLayer(tileLayers[name]);
+      curVers[name] = m.ver;
+      tileLayers[name] = makeTileLayer(name, m);
+      // costmap 开关状态
+      const on = name === 'map' ? true :
+        (name === 'cg' ? showCg : showCl);
+      DBG(name, '创建tileLayer并挂载:', on, 'bounds=[[0,0],[' + m.h + ',' + m.w + ']]');
+      if (on) tileLayers[name].addTo(map);
+      if (name === 'cg') tileLayers[name].setZIndex(200);
+      if (name === 'cl') tileLayers[name].setZIndex(300);
+    }
+    if (name === 'map' && !inited) {
+      inited = true;
+      DBG('fitBounds 到地图范围, 地图尺寸(格):', m.w, 'x', m.h);
+      map.fitBounds([[0, 0], [m.h, m.w]], { animate: false });
+      DBG('fitBounds后 zoom:', map.getZoom(), '中心:', map.getCenter().toString());
+      $('conn').textContent = '已连接';
+    }
+  }
+}
+let inited = false;
+let showCg = true, showCl = true;
+
+// ---------------- WebSocket: 路径/位姿/状态 ----------------
+let DATA = { global_plan: [], local_plan: [], teb_poses: [], robot: null,
+             goal: null, status: {}, pose_src: '--', events: [], rec: {on: false} };
+let follow = true;
+
+function connect() {
+  DBG('尝试连接WebSocket: ws://' + location.hostname + ':9095/ws');
+  const ws = new WebSocket('ws://' + location.hostname + ':9095/ws');
+  ws.onopen = () => { DBG('WebSocket已连接'); $('conn').textContent = '已连接'; };
+  ws.onerror = e => DBG('WebSocket错误:', e.type);
+  ws.onclose = () => { DBG('WebSocket断开, 3s后重连'); $('conn').textContent = '已断开，3s 后重连'; setTimeout(connect, 3000); };
+  ws.onmessage = ev => {
+    const d = JSON.parse(ev.data);
+    DATA = d;
+    // 图层版本变化 → 重新拉 layout 并换瓦片源（浏览器缓存让未变的瓦片零传输）
+    for (const name of ['map', 'cg', 'cl']) {
+      if (d.vers && d.vers[name] !== undefined && d.vers[name] !== curVers[name]) {
+        refreshLayout();
+        break;
+      }
+    }
+    if (follow && DATA.robot) {
+      const [x, y] = DATA.robot;
+      const m = layerMeta.map;
+      if (m) {
+        // 让机器人落在屏幕下三分之一处：中心需在机器人上方 H/6 像素
+        const rp = map.project(cellLatlng(x, y, m), map.getZoom());
+        const center = map.unproject(rp.subtract([0, innerHeight / 6]), map.getZoom());
+        const p = map.getCenter();
+        // 与目标偏差超过 5 格才动，减少 setView 风暴
+        if (Math.abs(center.lat - p.lat) > 5 || Math.abs(center.lng - p.lng) > 5)
+          map.setView(center, map.getZoom(), { animate: false });
+      }
+    }
+    updateUI();
+    updateRecBtn();
+    drawOverlay();
+  };
+}
+
+// ---------------- 覆盖层 canvas 绘制 ----------------
+const ov = $('ov'), octx = ov.getContext('2d');
+
+function cellLatlng(wx, wy, m) {
+  return L.latLng((wy - m.oy) / m.res, (wx - m.ox) / m.res);
+}
+function w2c(wx, wy, m) {  // world → container px
+  const p = map.latLngToContainerPoint(cellLatlng(wx, wy, m));
+  return [p.x, p.y];
+}
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  ov.width = innerWidth * dpr; ov.height = innerHeight * dpr;
+  ov.style.width = innerWidth + 'px'; ov.style.height = innerHeight + 'px';
+  drawOverlay();
+}
+window.addEventListener('resize', resize);
+map.on('move zoom viewreset', drawOverlay);
+
+function drawOverlay() {
+  const dpr = window.devicePixelRatio || 1;
+  octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  octx.clearRect(0, 0, innerWidth, innerHeight);
+  const m = layerMeta.map;
+  if (!m) return;
+
+  drawPath(DATA.global_plan, '#4caf50', 2);
+  drawPath(DATA.local_plan, '#ff9800', 2);
+  drawPath(DATA.teb_poses, '#e91e63', 1.5);
+
+  if (DATA.robot) {
+    const [x, y, th] = DATA.robot;
+    const [sx, sy] = w2c(x, y, m);
+    const r = 12;  // 固定像素大小，不随地图缩放变化
+    octx.save(); octx.translate(sx, sy); octx.rotate(-th);
+    octx.beginPath(); octx.moveTo(r * 1.6, 0);
+    octx.lineTo(-r, r * 0.8); octx.lineTo(-r, -r * 0.8); octx.closePath();
+    octx.fillStyle = '#2196f3'; octx.fill();
+    octx.strokeStyle = '#fff'; octx.lineWidth = 1.5; octx.stroke();
+    octx.restore();
+  }
+  if (DATA.goal) {
+    const [sx, sy] = w2c(DATA.goal[0], DATA.goal[1], m);
+    octx.beginPath(); octx.arc(sx, sy, 7, 0, Math.PI * 2);
+    octx.strokeStyle = '#f44336'; octx.lineWidth = 2.5; octx.stroke();
+    octx.beginPath(); octx.moveTo(sx - 4, sy - 4); octx.lineTo(sx + 4, sy + 4);
+    octx.moveTo(sx + 4, sy - 4); octx.lineTo(sx - 4, sy + 4);
+    octx.strokeStyle = '#f44336'; octx.stroke();
+  }
+  // 比例尺：从候选长度中选一个像素宽度在 40~160 之间的
+  const p1 = map.latLngToContainerPoint([0, 0]);
+  const p2 = map.latLngToContainerPoint([0, 1]);
+  const pxPerCell = Math.abs(p2.x - p1.x);
+  const res = m.res;
+  const cand = [0.5, 1, 2, 5, 10, 20, 50, 100];
+  let bar = 100, mLen = 10;
+  for (const c of cand) {
+    const px = c / res * pxPerCell;
+    if (px >= 40 && px <= 160) { bar = px; mLen = c; break; }
+    if (px > 160) { bar = px; mLen = c; break; }
+  }
+  octx.fillStyle = '#aaa'; octx.font = '11px sans-serif';
+  const bx = 14, by = innerHeight - 34;
+  octx.fillRect(bx, by, bar, 2);
+  octx.fillText(mLen + ' m', bx, by - 6);
+}
+
+function drawPath(pts, color, lw) {
+  if (!pts || pts.length < 2) return;
+  const m = layerMeta.map;
+  octx.beginPath();
+  let [px, py] = w2c(pts[0][0], pts[0][1], m);
+  octx.moveTo(px, py);
+  for (let i = 1; i < pts.length; i++) {
+    [px, py] = w2c(pts[i][0], pts[i][1], m);
+    octx.lineTo(px, py);
+  }
+  octx.strokeStyle = color; octx.lineWidth = lw; octx.lineJoin = 'round'; octx.stroke();
+}
+
+// ---------------- UI ----------------
+function fmtPos(v) { return typeof v === 'number' ? v.toFixed(2) : '--'; }
+
+function updateUI() {
+  const st = DATA.status || {};
+  $('s-status').textContent = st.text || '--';
+  $('s-status').style.background =
+    st.code === 3 ? '#2e7d32' : st.code === 4 ? '#c62828' :
+    st.code === 1 ? '#1565c0' : '#555';
+  $('s-goal').textContent = DATA.goal ?
+    '(' + DATA.goal[0].toFixed(2) + ', ' + DATA.goal[1].toFixed(2) + ')' : '--';
+  $('s-pose').textContent = DATA.robot ?
+    '(' + DATA.robot[0].toFixed(2) + ', ' + DATA.robot[1].toFixed(2) +
+    ', ' + (DATA.robot[2] * 57.3).toFixed(0) + '°)' : '--';
+  // 日志区：move_base 事件 + rosout WARN/ERROR（最新在上，双向滚动）
+  const logs = $('s-logs');
+  if (DATA.events && DATA.events.length) {
+    logs.innerHTML = DATA.events.map(e =>
+      '<div class="line" style="color:' + e.color + '">' +
+      '<span style="color:#666">' + e.t + '</span> ' + e.text + '</div>').join('');
+  } else {
+    logs.innerHTML = '<div class="line" style="color:#666">暂无日志（rosout WARN/ERROR 与 move_base 事件会显示在这里）</div>';
+  }
+}
+
+function updateBtns() {
+  $('b-follow').classList.toggle('on', follow);
+  $('b-cg').classList.toggle('on', showCg);
+  $('b-cl').classList.toggle('on', showCl);
+}
+
+$('b-follow').onclick = () => { follow = !follow; updateBtns(); };
+$('b-cg').onclick = () => { showCg = !showCg; updateBtns(); toggleLayer('cg', showCg); };
+$('b-cl').onclick = () => { showCl = !showCl; updateBtns(); toggleLayer('cl', showCl); };
+$('b-center').onclick = () => {
+  follow = false; updateBtns();
+  const m = layerMeta.map;
+  if (m) map.fitBounds([[0, 0], [m.h, m.w]]);
+};
+let panelCollapsed = false;
+let recBusy = false;
+$('b-rec').onclick = async () => {
+  if (recBusy) return;
+  recBusy = true;
+  try {
+    const act = DATA.rec && DATA.rec.on ? 'stop' : 'start';
+    const r = await (await fetch('/record/' + act)).json();
+    if (!r.ok) alert('录制操作失败: ' + r.err);
+  } catch (e) { alert('请求失败: ' + e); }
+  recBusy = false;
+};
+// 导航点 modal：从 /navpoints 动态加载（scripts/ 目录下的 .sh）
+let navList = [];
+async function loadNavBtns() {
+  try { navList = await (await fetch('/navpoints')).json(); } catch (e) {}
+  const box = $('modal-btns');
+  box.innerHTML = '';
+  if (!navList.length) {
+    box.innerHTML = '<div style="color:#999;font-size:13px;padding:8px">暂无可用脚本</div>';
+  }
+  for (const s of navList) {
+    const b = document.createElement('button');
+    b.textContent = '▶ ' + s.name;
+    b.onclick = async () => {
+      closeModal();
+      try { await fetch('/navpoint/' + s.id); } catch (e) { alert('请求失败: ' + e); }
+    };
+    box.appendChild(b);
+  }
+}
+function openModal() { $('modal-bg').style.display = 'flex'; }
+function closeModal() { $('modal-bg').style.display = 'none'; }
+$('b-nav').onclick = openModal;
+$('modal-close').onclick = closeModal;
+$('modal-bg').onclick = e => { if (e.target === $('modal-bg')) closeModal(); };
+
+function updateRecBtn() {
+  const on = DATA.rec && DATA.rec.on;
+  const b = $('b-rec');
+  b.textContent = on ? '■ 结束录制' : '● 开始录制';
+  b.style.borderColor = on ? '#ff5252' : '#333';
+  b.style.color = on ? '#fff' : '#ff5252';
+  b.style.background = on ? 'rgba(198,40,40,.6)' : 'rgba(0,0,0,.5)';
+}
+$('collapse').onclick = () => {
+  panelCollapsed = !panelCollapsed;
+  $('s-logs').style.display = panelCollapsed ? 'none' : '';
+  document.querySelector('.legend').style.display = panelCollapsed ? 'none' : '';
+  $('collapse').textContent = panelCollapsed ? '展开 ▼' : '收起 ▲';
+};
+
+function toggleLayer(name, on) {
+  if (!tileLayers[name]) return;
+  if (on) { tileLayers[name].addTo(map); tileLayers[name].setZIndex(name === 'cg' ? 200 : 300); }
+  else map.removeLayer(tileLayers[name]);
+}
+
+// ---------------- 启动 ----------------
+updateBtns();
+resize();
+setTimeout(() => map.invalidateSize(), 100);  // 容器尺寸变化后强制重算
+refreshLayout();
+loadNavBtns();
+setInterval(refreshLayout, 3000);  // 兜底轮询（WS 断连时也能恢复图层）
+connect();
+</script>
+</body>
+</html>
