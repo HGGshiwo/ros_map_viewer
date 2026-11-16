@@ -45,6 +45,9 @@
   .lg-g::before{background:#4caf50;}
   .lg-l::before{background:#ff9800;}
   .lg-t::before{background:#e91e63;}
+  #log-tags{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;}
+  #log-tags .tagchip{border:1px solid #333;border-radius:10px;padding:1px 10px;
+    font-size:11px;cursor:pointer;user-select:none;}
   #btns{position:absolute;bottom:14px;right:14px;display:flex;flex-direction:column;gap:8px;z-index:1000;}
   #btns button{background:rgba(0,0,0,.75);border:1px solid #444;color:#ddd;border-radius:10px;
     padding:10px 12px;font-size:14px;cursor:pointer;}
@@ -66,6 +69,7 @@
     <span class="lg-g">全局路径</span><span class="lg-l">局部路径</span>
     <span class="lg-t">TEB 轨迹</span>
   </div>
+  <div id="log-tags"></div>
   <div id="panel-head">
     <button id="b-nav">导航点 ▸</button>
     <button id="b-rec">● 开始录制</button>
@@ -307,15 +311,49 @@ function updateUI() {
   $('s-pose').textContent = DATA.robot ?
     '(' + DATA.robot[0].toFixed(2) + ', ' + DATA.robot[1].toFixed(2) +
     ', ' + (DATA.robot[2] * 57.3).toFixed(0) + '°)' : '--';
-  // 日志区：move_base 事件 + rosout WARN/ERROR（最新在上，双向滚动）
+  // 日志区：move_base 事件 + rosout WARN/ERROR（最新在上，双向滚动，按来源开关过滤）
   const logs = $('s-logs');
-  if (DATA.events && DATA.events.length) {
-    logs.innerHTML = DATA.events.map(e =>
+  const evs = DATA.events || [];
+  // 收集出现过的来源 tag：mb=move_base事件, rosout 取节点首段
+  const tags = {};
+  for (const e of evs) {
+    const t = e.kind === 'rosout' ? (e.source || 'rosout').replace(/^\//, '').split('/')[0] : 'mb';
+    e.tag = t;
+    tags[t] = true;
+  }
+  for (const t of Object.keys(tags))
+    if (!(t in logTagFilter)) logTagFilter[t] = true;
+  renderLogTags(Object.keys(logTagFilter).sort());
+  const shown = evs.filter(e => logTagFilter[e.tag] !== false);
+  if (shown.length) {
+    logs.innerHTML = shown.map(e =>
       '<div class="line" style="color:' + e.color + '">' +
       '<span style="color:#666">' + e.t + '</span> ' + e.text + '</div>').join('');
   } else {
-    logs.innerHTML = '<div class="line" style="color:#666">暂无日志（rosout WARN/ERROR 与 move_base 事件会显示在这里）</div>';
+    logs.innerHTML = '<div class="line" style="color:#666">暂无日志</div>';
   }
+}
+
+// 来源开关 UI
+let logTagFilter = {};
+function renderLogTags(tagList) {
+  const row = $('log-tags');
+  if (!row) return;
+  row.innerHTML = tagList.map(t => {
+    const on = logTagFilter[t] !== false;
+    return '<span class="tagchip" data-t="' + t + '" style="' +
+      (on ? 'color:#4fc3f7;border-color:#4fc3f7' : 'color:#666;border-color:#333;text-decoration:line-through') +
+      '">' + (t === 'mb' ? 'move_base事件' : t) + '</span>';
+  }).join('');
+  row.querySelectorAll('.tagchip').forEach(el => {
+    el.onclick = () => {
+      const t = el.dataset.t;
+      logTagFilter[t] = logTagFilter[t] === false ? true : false;
+      renderLogTags(tagList);
+      // 触发重绘日志
+      if (DATA) updateUI();
+    };
+  });
 }
 
 function updateBtns() {

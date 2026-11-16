@@ -1,3 +1,12 @@
-# 录制时排除的话题列表
+# ros_map_viewer 配置
+# 录制时排除的话题
 exclude_topics:
   - /loc_map
+
+# 日志面板显示的节点来源开关（true=显示其 WARN/ERROR，false=屏蔽）
+# 节点名以这里的前缀匹配，修改保存后重启脚本生效
+log_nodes:
+  move_base: true
+  amcl: true
+  slam: true
+  cmd_vel: true

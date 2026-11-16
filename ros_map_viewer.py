@@ -242,21 +242,59 @@ import os
 EXCLUDE_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "exclude.yaml")
 
+# 导航相关节点的前缀：节点名命中任意前缀即视为导航日志来源
+NAV_NODE_PREFIXES = [
+    "/move_base",           # move_base 及其子节点 (TEB 等)
+    "/amcl",                # 定位
+    "/gmapping", "/slam", "/cartographer", "/map_server",  # 建图/地图
+    "/robot_state_publisher", "/joint_state_publisher",    # TF 发布
+    "/cmd_vel", "/scan", "/obstacle",                       # 控制/感知相关节点
+]
 
-def load_exclude_topics():
-    """从 YAML 读取录制时排除的话题列表"""
+_DEFAULT_CFG = """# ros_map_viewer 配置
+# 录制时排除的话题
+exclude_topics:
+  - /loc_map
+
+# 日志面板显示的节点来源开关（true=显示其 WARN/ERROR，false=屏蔽）
+# 节点名以这里的前缀匹配
+log_nodes:
+  move_base: true
+  amcl: true
+  slam: true
+  cmd_vel: true
+"""
+
+
+def load_config():
+    """读取 exclude.yaml（兼容旧格式）；返回 (排除话题列表, 日志节点开关dict)"""
     try:
         import yaml
     except ImportError:
-        print("[record] 未安装 PyYAML，无法读取排除配置（pip install pyyaml）")
-        return []
+        print("[config] 未安装 PyYAML（pip install pyyaml）")
+        return [], {}
     if not os.path.isfile(EXCLUDE_FILE):
         with open(EXCLUDE_FILE, "w") as f:
-            f.write("# 录制时排除的话题列表\nexclude_topics:\n  - /loc_map\n")
-        print("[record] 已生成默认排除配置: %s" % EXCLUDE_FILE)
+            f.write(_DEFAULT_CFG)
+        print("[config] 已生成默认配置: %s" % EXCLUDE_FILE)
     with open(EXCLUDE_FILE) as f:
         cfg = yaml.safe_load(f) or {}
-    return list(cfg.get("exclude_topics") or [])
+    return list(cfg.get("exclude_topics") or []), dict(cfg.get("log_nodes") or {})
+
+
+def load_exclude_topics():
+    return load_config()[0]
+
+
+def load_log_node_tags():
+    return load_config()[1]
+
+
+def is_nav_node(node_name):
+    """节点名是否属于导航相关节点"""
+    node = node_name or ""
+    return any(node == p or node.startswith(p + "/") or node.startswith(p)
+               for p in NAV_NODE_PREFIXES)
 
 
 def _rec_cb(topic):
@@ -328,16 +366,25 @@ def rec_stop():
 
 
 def cb_rosout(msg):
-    """只记录 WARN 及以上级别的 rosout 日志"""
-    if msg.level < 2:  # DEBUG=1, INFO=2? ROS: DEBUG=1 INFO=2 WARN=4 ERROR=8
+    """记录导航相关节点的 WARN 及以上级别日志，来源可通过 YAML tag 开关"""
+    if msg.level < 4:          # DEBUG=1 INFO=2 WARN=4 ERROR=8 FATAL=16
         return
-    if msg.level == 2:  # INFO 不记录
+    node = msg.name or ""
+    if not is_nav_node(node):
         return
-    names = {4: "WARN", 8: "ERROR", 16: "FATAL", 3: "DEBUG"}
+    # tag 开关：节点名以哪个前缀命中，就用 YAML 里对应 tag 的布尔值
+    tags = load_log_node_tags()
+    for p in NAV_NODE_PREFIXES:
+        if node == p or node.startswith(p + "/") or node.startswith(p):
+            tag = p.lstrip("/").split("/")[0]
+            if tags.get(tag, True) is False:
+                return
+            break
+    names = {4: "WARN", 8: "ERROR", 16: "FATAL"}
     lv = names.get(msg.level, str(msg.level))
-    _log_event(u"[%s][%s] %s" % (lv, msg.name, msg.msg),
+    _log_event(u"[%s][%s] %s" % (lv, node, msg.msg),
                kind="rosout", color=ROSOUT_COLORS.get(msg.level, "#ff9800"),
-               source=msg.name)
+               source=node)
 
 
 def cb_status(msg):
