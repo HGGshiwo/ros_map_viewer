@@ -156,6 +156,7 @@ async function refreshLayout() {
   for (const name of ['map', 'cg', 'cl']) {
     const m = lay[name];
     if (!m) { DBG(name, '图层不存在于layout, 跳过'); continue; }
+    layerMeta[name] = m;
     if (!tileLayers[name]) {
       // 首次挂载
       curVers[name] = m.ver;
