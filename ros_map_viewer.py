@@ -37,7 +37,7 @@ try:
     import rospy
     from nav_msgs.msg import OccupancyGrid, Path, Odometry
     from geometry_msgs.msg import PoseStamped, PoseArray
-    from actionlib_msgs.msg import GoalStatusArray, GoalStatus
+    from actionlib_msgs.msg import GoalStatusArray, GoalStatus, GoalID
     from rosgraph_msgs.msg import Log
     from move_base_msgs.msg import MoveBaseActionFeedback, MoveBaseActionResult
     import tf
@@ -94,20 +94,31 @@ class SharedState(object):
 
 STATE = SharedState()
 
-# cost → RGBA LUT（与服务端渲染 PNG 用）
-def _build_cost_lut():
+# cost → RGBA LUT（服务端渲染瓦片用）；全局与局部用不同色系错开
+def _build_cost_lut(local=False):
     lut = np.zeros((256, 4), dtype=np.uint8)
     t = np.arange(98) / 98.0
-    lut[1:99, 0] = (66 + t * 178).astype(np.uint8)
-    lut[1:99, 1] = (165 - t * 98).astype(np.uint8)
-    lut[1:99, 2] = (245 - t * 190).astype(np.uint8)
-    lut[1:99, 3] = (30 + t * 120).astype(np.uint8)
-    lut[99:253] = [244, 67, 54, 190]
-    lut[253:255] = [233, 30, 99, 200]
-    lut[255] = [60, 60, 60, 110]
+    if local:
+        # 局部: 青绿 → 橙 (与全局蓝→红错开)
+        lut[1:99, 0] = (0 + t * 255).astype(np.uint8)
+        lut[1:99, 1] = (200 - t * 60).astype(np.uint8)
+        lut[1:99, 2] = (180 - t * 120).astype(np.uint8)
+        lut[1:99, 3] = (30 + t * 120).astype(np.uint8)
+        lut[99:253] = [255, 140, 0, 190]     # lethal: 橙
+        lut[253:255] = [255, 60, 0, 200]     # 致命: 深橙红
+    else:
+        # 全局: 蓝 → 红
+        lut[1:99, 0] = (66 + t * 178).astype(np.uint8)
+        lut[1:99, 1] = (165 - t * 98).astype(np.uint8)
+        lut[1:99, 2] = (245 - t * 190).astype(np.uint8)
+        lut[1:99, 3] = (30 + t * 120).astype(np.uint8)
+        lut[99:253] = [244, 67, 54, 190]     # lethal: 红
+        lut[253:255] = [233, 30, 99, 200]
+    lut[255] = [60, 60, 60, 110]             # 未知: 半透明灰
     return lut
 
 COST_LUT = _build_cost_lut() if np is not None else None
+COST_LUT_LOCAL = _build_cost_lut(local=True) if np is not None else None
 
 
 # ----------------------------------------------------------------------------
@@ -117,8 +128,10 @@ def path_to_points(msg):
     return [[p.pose.position.x, p.pose.position.y] for p in msg.poses]
 
 
-def _set_layer(name, msg, costmap):
-    """编码 OccupancyGrid 并存入 STATE.layers"""
+def _encode_grid(msg, costmap):
+    """OccupancyGrid 消息 → (raw HxW uint8, ox, oy, res, w, h)
+    保持消息自身的网格与原点，不做任何变换。
+    raw 第0行 = 窗口底部（ROS 标准），-1(未知) → 255"""
     if np is not None:
         arr = np.array(msg.data, dtype=np.int16)
         if costmap:
@@ -139,25 +152,22 @@ def _set_layer(name, msg, costmap):
                 raw[i] = 255
         raw = np.frombuffer(bytes(raw), dtype=np.uint8).reshape(
             msg.info.height, msg.info.width)
-    with STATE.lock:
-        prev = STATE.layers.get(name)
-        ver = (prev["ver"] + 1) if prev else 1
-        STATE.layers[name] = {
-            "raw": raw,
-            "res": msg.info.resolution,
-            "ox": msg.info.origin.position.x,
-            "oy": msg.info.origin.position.y,
-            "w": msg.info.width, "h": msg.info.height,
-            "ver": ver,
-        }
+    return (raw, msg.info.origin.position.x, msg.info.origin.position.y,
+            msg.info.resolution, msg.info.width, msg.info.height)
 
 
 def cb_map(msg):
-    _set_layer("map", msg, costmap=False)
+    raw, ox, oy, res, w, h = _encode_grid(msg, costmap=False)
+    digest = hashlib.md5(raw.tobytes()).hexdigest()
     with STATE.lock:
-        ver = STATE.layers["map"]["ver"]
+        prev = STATE.layers.get("map")
+        if prev and prev.get("digest") == digest:
+            return
+        ver = (prev["ver"] + 1) if prev else 1
+        STATE.layers["map"] = {"raw": raw, "ox": ox, "oy": oy, "res": res,
+                               "w": w, "h": h, "ver": ver, "digest": digest}
     _invalidate_tiles("map")
-    print("[viewer] 地图更新 ver=%d (%dx%d)" % (ver, msg.info.width, msg.info.height))
+    print("[viewer] 地图更新 ver=%d (%dx%d)" % (ver, w, h))
 
 
 def _invalidate_tiles(name):
@@ -167,23 +177,23 @@ def _invalidate_tiles(name):
 
 
 def _make_costmap_cb(name):
+    """costmap 回调：编码（保持自身网格与原点，不做任何变换）+ digest 去重。
+    坐标对齐由通用瓦片渲染函数 render_tile_from_grid 按需采样完成。"""
     def cb(msg):
         now = time.time()
         if now - getattr(cb, "_t", 0) < 0.5:   # ≤2Hz
             return
         cb._t = now
-        _set_layer(name, msg, costmap=True)
-        with STATE.lock:
-            new = STATE.layers[name]
-        digest = hashlib.md5(new["raw"].tobytes()).hexdigest()
+        raw, ox, oy, res, w, h = _encode_grid(msg, costmap=True)
+        digest = hashlib.md5(raw.tobytes()).hexdigest()
         if digest == getattr(cb, "_digest", None):
-            # 内容没变：回滚这次的 ver 递增
-            with STATE.lock:
-                new["ver"] -= 1
-                if new["ver"] < 1:
-                    new["ver"] = 1
-            return
+            return                       # 内容没变：不动状态
         cb._digest = digest
+        with STATE.lock:
+            prev = STATE.layers.get(name)
+            ver = (prev["ver"] + 1) if prev else 1
+            STATE.layers[name] = {"raw": raw, "ox": ox, "oy": oy, "res": res,
+                                  "w": w, "h": h, "ver": ver}
         _invalidate_tiles(name)
     return cb
 
@@ -406,9 +416,43 @@ def cb_status(msg):
         STATE.status = info
 
 
+goal_pub = None
+cancel_pub = None
+
+
+def cancel_nav_goal():
+    """向 /move_base/cancel 发布空 GoalID，取消当前所有导航目标"""
+    if cancel_pub is None:
+        return "未连接 ROS"
+    cancel_pub.publish(GoalID())
+    _log_event(u"网页取消导航目标", 1)
+    print("[viewer] 取消导航目标")
+    return None
+
+
+def send_nav_goal(wx, wy, yaw=0.0):
+    """向 /move_base_simple/goal 发布目标点（map 系），RViz 2D Nav Goal 同款。
+    合法性由 move_base 自行判断。"""
+    if goal_pub is None:
+        return "未连接 ROS"
+    msg = PoseStamped()
+    msg.header.stamp = rospy.Time.now()
+    msg.header.frame_id = "map"
+    msg.pose.position.x = wx
+    msg.pose.position.y = wy
+    msg.pose.orientation.z = math.sin(yaw / 2.0)
+    msg.pose.orientation.w = math.cos(yaw / 2.0)
+    goal_pub.publish(msg)
+    _log_event(u"网页发送目标点: (%.2f, %.2f)" % (wx, wy), 1)
+    print("[viewer] 发送目标点: (%.2f, %.2f, yaw=%.2f)" % (wx, wy, yaw))
+    return None
+
+
 def cb_goal(msg):
+    q = msg.pose.orientation
+    yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
     with STATE.lock:
-        STATE.goal = [msg.pose.position.x, msg.pose.position.y]
+        STATE.goal = [msg.pose.position.x, msg.pose.position.y, yaw]
 
 
 def cb_odom(msg):
@@ -464,6 +508,11 @@ def ros_node(args):
     rospy.Subscriber("/rosout", Log, cb_rosout, queue_size=50)
     rospy.Subscriber("/move_base/current_goal", PoseStamped, cb_goal, queue_size=1)
     rospy.Subscriber("/move_base_simple/goal", PoseStamped, cb_goal, queue_size=1)
+
+    # 网页"2D 导航目标"发布器（RViz 同款功能）
+    global goal_pub, cancel_pub
+    goal_pub = rospy.Publisher("/move_base_simple/goal", PoseStamped, queue_size=1)
+    cancel_pub = rospy.Publisher("/move_base/cancel", GoalID, queue_size=1)
     rospy.Subscriber("/odom", Odometry, cb_odom, queue_size=1)
 
     threading.Thread(target=tf_thread, args=(tf_listener,), daemon=True).start()
@@ -490,35 +539,52 @@ def png_encode(rgba):
 
 
 def render_tile(name, tx, ty):
-    """返回该瓦片 PNG bytes。
-    坐标推导（已用局部costmap与地图的相关性实验验证）：
-    - raw 第0行 = 底部（ROS标准），行号 rb = 世界纬度格 = 像素 y 的相反数
-    - Leaflet CRS.Simple: 像素 y = -lat，瓦片 ty 覆盖像素 y [ty*256, ty*256+256)
-      → 对应 raw 行区间 rb ∈ [-ty*256-256, -ty*256)，即最高的瓦片 ty=-n 含 raw 尾部行
-    - 瓦片内自上而下 = raw 行自大而小 → 需要垂直翻转切片"""
+    """通用瓦片渲染：任意 map 系栅格图层 → 瓦片 PNG。
+    对 map / cg / cl 三层复用。原理：
+    - 瓦片空间以全局地图网格为基准（原点 ox_map/oy_map，分辨率 res_map）
+    - 瓦片 (tx,ty) 每个像素 (u,v) 的世界坐标：
+        x = ox_map + (tx*256 + u + 0.5) * res_map
+        y = oy_map + (h_map − (ty*256 + v + 0.5)) * res_map   ← v 自顶部，y 自底部
+    - 世界坐标 → 源数组行列（最近邻）：col=(x−ox_s)/res_s, row=(y−oy_s)/res_s
+      原点、分辨率差异在此自然吸收；"第0行=底部"约定也在此统一处理，
+      不再存在任何手工翻转"""
     with STATE.lock:
         layer = STATE.layers.get(name)
         if layer is None:
             return None
-        w, h = layer["w"], layer["h"]
+        base = STATE.layers.get("map") or layer   # 瓦片空间基准层
+        b_ox, b_oy, b_res, b_h = base["ox"], base["oy"], base["res"], base["h"]
+        s_ox, s_oy, s_res = layer["ox"], layer["oy"], layer["res"]
+        s_w, s_h = layer["w"], layer["h"]
         raw = layer["raw"]
         is_map = (name == "map")
-    canvas = np.zeros((TILE, TILE, 4), dtype=np.uint8)
-    x0, x1 = tx * TILE, min(tx * TILE + TILE, w)
-    rb_hi = min(-ty * TILE, h)              # 区间上界（不含）
-    rb_lo = max(-ty * TILE - TILE, 0)       # 区间下界
-    if x0 >= x1 or tx < 0 or rb_hi <= rb_lo:
-        return png_encode(canvas)  # 完全在图外 → 空瓦片（透明）
+        lut = COST_LUT if name == "cg" else COST_LUT_LOCAL
+
+    # 每个瓦片像素中心对应的世界坐标（向量化）。
+    # Leaflet CRS.Simple: pixel_y = -lat，正纬度地图位于像素 y 负半区，
+    # 因此瓦片 ty 恒为负数；lat_cells = -(ty*TILE + v + 0.5) 直接得到
+    # "自底部"的正向网格行号（ty=-1 是最靠下的瓦片），无需再做 b_h 减法翻转
+    lat_cells = -(ty * TILE + np.arange(TILE) + 0.5)
+    us = tx * TILE + np.arange(TILE) + 0.5     # 自左侧（x 正半区，tx 恒为正）
+    wy = b_oy + lat_cells * b_res
+    wx = b_ox + us * b_res
+    # 源数组行列（rb: 第0行 = 源底部）
+    rbf = (wy - s_oy) / s_res
+    cbf = (wx - s_ox) / s_res
+    ri = np.clip(np.floor(rbf).astype(np.int64), 0, s_h - 1)
+    ci = np.clip(np.floor(cbf).astype(np.int64), 0, s_w - 1)
+    # 行/列有效性必须分轴计算再外积——混在一维向量里会互相矛盾导致全透明
+    valid = ((rbf >= 0) & (rbf < s_h))[:, None] & ((cbf >= 0) & (cbf < s_w))[None, :]
+
+    vals = raw[np.ix_(ri, ci)]                 # (TILE, TILE)
+    rgba = np.zeros((TILE, TILE, 4), dtype=np.uint8)
     if is_map or np is None:
-        sub = raw[rb_lo:rb_hi, x0:x1][::-1]
-        rgba = np.empty((sub.shape[0], sub.shape[1], 4), dtype=np.uint8)
-        rgba[..., 0:3] = sub[..., None]
-        rgba[..., 3] = 255
+        rgba[..., 0:3] = vals[..., None]
+        rgba[..., 3] = np.where(valid, 255, 0).astype(np.uint8)
     else:
-        rgba = COST_LUT[raw[rb_lo:rb_hi, x0:x1][::-1]]
-    off = rb_lo - (-ty * TILE - TILE)       # 越界裁剪后的瓦片内行偏移
-    canvas[off:off + rgba.shape[0], :rgba.shape[1]] = rgba
-    return png_encode(canvas)
+        rgba = lut[vals]
+        rgba[..., 3] = np.where(valid, rgba[..., 3], 0).astype(np.uint8)
+    return png_encode(rgba)
 
 
 TILE_CACHE = OrderedDict()   # (name, ver, tx, ty) → png bytes
@@ -681,6 +747,7 @@ def ws_server(port):
 # ----------------------------------------------------------------------------
 # HTTP：页面 / leaflet 静态文件 / layout / 瓦片
 # ----------------------------------------------------------------------------
+import math
 import os
 import subprocess
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -736,6 +803,46 @@ class Handler(BaseHTTPRequestHandler):
                 if ".." in f:
                     self.send_error(403); return
                 self._serve_file(os.path.join(STATIC_DIR, f))
+            elif path == "/navgoal":
+                from urllib.parse import urlparse, parse_qs
+                qs = parse_qs(urlparse(self.path).query)
+                try:
+                    wx = float(qs["x"][0]); wy = float(qs["y"][0])
+                    yaw = float(qs.get("yaw", ["0"])[0])
+                except (KeyError, ValueError):
+                    self.send_error(400); return
+                err = send_nav_goal(wx, wy, yaw)
+                body = json.dumps({"ok": err is None, "err": err or ""},
+                                  ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif path == "/debug/cbinfo":
+                info = {}
+                for cbname, cb in (("cl", cb_costmap_local), ("cg", cb_costmap_global)):
+                    info[cbname] = {
+                        "收包数": getattr(cb, "_n", 0),
+                        "节流丢弃": getattr(cb, "_drop", 0),
+                        "内容相同跳过": getattr(cb, "_same", 0),
+                        "提交数": getattr(cb, "_commits", 0),
+                    }
+                body = json.dumps(info).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif path == "/navgoal/cancel":
+                err = cancel_nav_goal()
+                body = json.dumps({"ok": err is None, "err": err or ""},
+                                  ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             elif path == "/navpoints":
                 body = json.dumps(list_nav_scripts(), ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
@@ -887,7 +994,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
                 self.send_header("Content-Length", str(len(png)))
-                self.send_header("Cache-Control", "max-age=3600")
+                # 地图层内容基本不变可长缓存；costmap 2Hz 更新需浏览器每次回源
+                self.send_header("Cache-Control",
+                                 "max-age=86400" if name == "map" else "no-cache")
                 self.end_headers()
                 self.wfile.write(png)
             else:

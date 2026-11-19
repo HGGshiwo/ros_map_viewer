@@ -1,2 +1,5 @@
 *.bag
-__pycache__
+__pycache__/
+rosbags/
+*.png
+!static/**/*.png

@@ -71,7 +71,10 @@
   </div>
   <div id="log-tags"></div>
   <div id="panel-head">
-    <button id="b-nav">导航点 ▸</button>
+    <button id="b-goal">2D 目标点</button>
+    <button id="b-cancel" style="background:rgba(0,0,0,.5);border:1px solid #333;color:#ff9800;
+      border-radius:8px;padding:4px 10px;font-size:13px;cursor:pointer;white-space:nowrap;">
+      ✕ 取消目标</button>
     <button id="b-rec">● 开始录制</button>
     <button id="collapse">收起 ▲</button>
   </div>
@@ -128,12 +131,14 @@ const layerMeta = {};      // name → {res,ox,oy,w,h,ver}
 let curVers = {};          // name → 当前已挂载的版本
 
 function makeTileLayer(name, m) {
-  const tl = L.tileLayer('/tile/' + name + '/{z}/{x}/{y}.png?v=' + m.ver + '_r7', {
+  // 所有图层的瓦片都在"全局地图网格"坐标系采样，bounds 统一用地图尺寸
+  const bm = layerMeta.map || m;
+  const tl = L.tileLayer('/tile/' + name + '/{z}/{x}/{y}.png?v=' + m.ver + '_r11', {
     tileSize: 256,
     minZoom: -4,          // 关键修复：必须 ≤ 地图缩放级，否则图层直接不加载任何瓦片
     maxZoom: 6,
     minNativeZoom: 0, maxNativeZoom: 0,
-    bounds: [[0, 0], [m.h, m.w]], noWrap: true, updateWhenIdle: true, keepBuffer: 1,
+    bounds: [[0, 0], [bm.h, bm.w]], noWrap: true, updateWhenIdle: true, keepBuffer: 1,
   });
   let failed = 0;
   tl.on('tileerror', e => { failed++; DBG(name, 'tile加载失败:', e.tile.src, failed); });
@@ -151,18 +156,33 @@ async function refreshLayout() {
   for (const name of ['map', 'cg', 'cl']) {
     const m = lay[name];
     if (!m) { DBG(name, '图层不存在于layout, 跳过'); continue; }
-    layerMeta[name] = m;
-    if (!tileLayers[name] || curVers[name] !== m.ver) {
-      if (tileLayers[name]) map.removeLayer(tileLayers[name]);
+    if (!tileLayers[name]) {
+      // 首次挂载
       curVers[name] = m.ver;
       tileLayers[name] = makeTileLayer(name, m);
-      // costmap 开关状态
       const on = name === 'map' ? true :
         (name === 'cg' ? showCg : showCl);
-      DBG(name, '创建tileLayer并挂载:', on, 'bounds=[[0,0],[' + m.h + ',' + m.w + ']]');
+      DBG(name, '创建tileLayer并挂载:', on);
       if (on) tileLayers[name].addTo(map);
       if (name === 'cg') tileLayers[name].setZIndex(200);
       if (name === 'cl') tileLayers[name].setZIndex(300);
+    } else if (curVers[name] !== m.ver) {
+      // 内容更新：仅当网格尺寸变化才重建图层；否则原地 redraw 重取瓦片
+      // （costmap 瓦片为 no-cache，redraw 即可拿到新内容，无闪烁）
+      const sizeChanged = layerMeta[name] &&
+        (layerMeta[name].w !== m.w || layerMeta[name].h !== m.h);
+      curVers[name] = m.ver;
+      layerMeta[name] = m;
+      if (sizeChanged) {
+        map.removeLayer(tileLayers[name]);
+        tileLayers[name] = makeTileLayer(name, m);
+        const on = name === 'map' ? true : (name === 'cg' ? showCg : showCl);
+        if (on) tileLayers[name].addTo(map);
+        if (name === 'cg') tileLayers[name].setZIndex(200);
+        if (name === 'cl') tileLayers[name].setZIndex(300);
+      } else {
+        tileLayers[name].redraw();
+      }
     }
     if (name === 'map' && !inited) {
       inited = true;
@@ -247,6 +267,23 @@ function drawOverlay() {
   drawPath(DATA.local_plan, '#ff9800', 2);
   drawPath(DATA.teb_poses, '#e91e63', 1.5);
 
+  // 目标点箭头预览
+  if (goalMode && goalPreview) {
+    const [ax, ay, bx, by] = goalPreview;
+    const [x0, y0] = w2c(ax, ay, m);
+    const [x1, y1] = w2c(bx, by, m);
+    octx.beginPath(); octx.moveTo(x0, y0); octx.lineTo(x1, y1);
+    octx.strokeStyle = '#f44336'; octx.lineWidth = 2.5; octx.stroke();
+    const ang = Math.atan2(y1 - y0, x1 - x0), hl = 12;
+    octx.beginPath(); octx.moveTo(x1, y1);
+    octx.lineTo(x1 - hl * Math.cos(ang - 0.45), y1 - hl * Math.sin(ang - 0.45));
+    octx.lineTo(x1 - hl * Math.cos(ang + 0.45), y1 - hl * Math.sin(ang + 0.45));
+    octx.closePath(); octx.fillStyle = '#f44336'; octx.fill();
+    // 起点圆
+    octx.beginPath(); octx.arc(x0, y0, 5, 0, Math.PI * 2);
+    octx.fillStyle = '#f44336'; octx.fill();
+  }
+
   if (DATA.robot) {
     const [x, y, th] = DATA.robot;
     const [sx, sy] = w2c(x, y, m);
@@ -259,12 +296,20 @@ function drawOverlay() {
     octx.restore();
   }
   if (DATA.goal) {
-    const [sx, sy] = w2c(DATA.goal[0], DATA.goal[1], m);
-    octx.beginPath(); octx.arc(sx, sy, 7, 0, Math.PI * 2);
+    const [gx, gy, gyaw] = DATA.goal;
+    const [sx, sy] = w2c(gx, gy, m);
+    const ga = -(gyaw || 0), L = 22;   // 方向线长度(像素)
+    octx.beginPath(); octx.arc(sx, sy, 6, 0, Math.PI * 2);
     octx.strokeStyle = '#f44336'; octx.lineWidth = 2.5; octx.stroke();
-    octx.beginPath(); octx.moveTo(sx - 4, sy - 4); octx.lineTo(sx + 4, sy + 4);
-    octx.moveTo(sx + 4, sy - 4); octx.lineTo(sx - 4, sy + 4);
-    octx.strokeStyle = '#f44336'; octx.stroke();
+    // 方向箭头
+    const ex = sx + L * Math.cos(ga), ey = sy + L * Math.sin(ga);
+    octx.beginPath(); octx.moveTo(sx, sy); octx.lineTo(ex, ey);
+    octx.strokeStyle = '#f44336'; octx.lineWidth = 2.5; octx.stroke();
+    const hl = 9;
+    octx.beginPath(); octx.moveTo(ex, ey);
+    octx.lineTo(ex - hl * Math.cos(ga - 0.45), ey - hl * Math.sin(ga - 0.45));
+    octx.lineTo(ex - hl * Math.cos(ga + 0.45), ey - hl * Math.sin(ga + 0.45));
+    octx.closePath(); octx.fillStyle = '#f44336'; octx.fill();
   }
   // 比例尺：从候选长度中选一个像素宽度在 40~160 之间的
   const p1 = map.latLngToContainerPoint([0, 0]);
@@ -370,6 +415,110 @@ $('b-center').onclick = () => {
   const m = layerMeta.map;
   if (m) map.fitBounds([[0, 0], [m.h, m.w]]);
 };
+// ---- 2D 目标点（RViz 2D Nav Goal 同款）：按下→拖动画箭头→松开发送 ----
+let goalMode = false;
+let goalDrag = null;   // {startLatlng, endLatlng}
+let goalPreview = null;
+
+function exitGoalMode() {
+  goalMode = false; goalDrag = null; goalPreview = null;
+  map.dragging.enable();
+  $('b-goal').classList.remove('on');
+  ov.style.cursor = 'grab';
+  drawOverlay();
+}
+function w2world(latlng) {
+  const m = layerMeta.map;
+  return [m.ox + latlng.lng * m.res, m.oy + latlng.lat * m.res];
+}
+
+$('b-goal').onclick = () => {
+  goalMode = !goalMode;
+  if (goalMode) {
+    follow = false; updateBtns();
+    map.dragging.disable();               // 目标模式下禁用地图拖拽
+    ov.style.cursor = 'crosshair';
+    $('b-goal').classList.add('on');
+  } else exitGoalMode();
+};
+
+// 用 map 容器的原生鼠标/触摸事件画箭头（Leaflet dragging 已禁用，不冲突）
+const mapEl = map.getContainer();
+function goalEvt(e) {
+  const rect = mapEl.getBoundingClientRect();
+  return map.mouseEventToLatLng({ clientX: e.clientX - rect.left,
+                                  clientY: e.clientY - rect.top });
+}
+mapEl.addEventListener('mousedown', e => {
+  if (!goalMode || e.button !== 0) return;
+  goalDrag = { start: goalEvt(e) };
+  e.preventDefault();
+});
+mapEl.addEventListener('mousemove', e => {
+  if (!goalMode || !goalDrag) return;
+  goalDrag.end = goalEvt(e);
+  const m = layerMeta.map;
+  if (!m) return;
+  const [wx0, wy0] = w2world(goalDrag.start);
+  const [wx1, wy1] = w2world(goalDrag.end);
+  goalPreview = [wx0, wy0, wx1, wy1];
+  drawOverlay();
+});
+mapEl.addEventListener('mouseup', e => {
+  if (!goalMode || !goalDrag) return;
+  const end = goalEvt(e);
+  const m = layerMeta.map;
+  const [wx0, wy0] = w2world(goalDrag.start);
+  const [wx1, wy1] = w2world(end);
+  goalDrag = null; goalPreview = null;
+  exitGoalMode();
+  if (!m) return;
+  const yaw = Math.atan2(wy1 - wy0, wx1 - wx0);   // 拖动方向 → 朝向
+  fetch('/navgoal?x=' + wx0.toFixed(3) + '&y=' + wy0.toFixed(3) +
+        '&yaw=' + yaw.toFixed(3))
+    .then(r => r.json())
+    .then(r => { if (!r.ok) alert('发送失败: ' + r.err); })
+    .catch(e => alert('请求失败: ' + e));
+});
+// 触摸支持（移动端）
+mapEl.addEventListener('touchstart', e => {
+  if (!goalMode || e.touches.length !== 1) return;
+  goalDrag = { start: goalEvt(e.touches[0]) };
+  e.preventDefault();
+}, { passive: false });
+mapEl.addEventListener('touchmove', e => {
+  if (!goalMode || !goalDrag) return;
+  goalDrag.end = goalEvt(e.touches[0]);
+  const m = layerMeta.map;
+  if (!m) return;
+  const [wx0, wy0] = w2world(goalDrag.start);
+  const [wx1, wy1] = w2world(goalDrag.end);
+  goalPreview = [wx0, wy0, wx1, wy1];
+  drawOverlay();
+  e.preventDefault();
+}, { passive: false });
+mapEl.addEventListener('touchend', e => {
+  if (!goalMode || !goalDrag) return;
+  const [wx0, wy0] = w2world(goalDrag.start);
+  const end = goalDrag.end || goalDrag.start;
+  const [wx1, wy1] = w2world(end);
+  goalDrag = null; goalPreview = null;
+  exitGoalMode();
+  const yaw = Math.atan2(wy1 - wy0, wx1 - wx0);
+  fetch('/navgoal?x=' + wx0.toFixed(3) + '&y=' + wy0.toFixed(3) +
+        '&yaw=' + yaw.toFixed(3))
+    .then(r => r.json())
+    .then(r => { if (!r.ok) alert('发送失败: ' + r.err); })
+    .catch(e => alert('请求失败: ' + e));
+});
+
+$('b-cancel').onclick = async () => {
+  try {
+    const r = await (await fetch('/navgoal/cancel')).json();
+    if (!r.ok) alert('取消失败: ' + r.err);
+  } catch (e) { alert('请求失败: ' + e); }
+};
+
 let panelCollapsed = false;
 let recBusy = false;
 $('b-rec').onclick = async () => {
@@ -403,7 +552,6 @@ async function loadNavBtns() {
 }
 function openModal() { $('modal-bg').style.display = 'flex'; }
 function closeModal() { $('modal-bg').style.display = 'none'; }
-$('b-nav').onclick = openModal;
 $('modal-close').onclick = closeModal;
 $('modal-bg').onclick = e => { if (e.target === $('modal-bg')) closeModal(); };
 
