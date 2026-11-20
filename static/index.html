@@ -130,10 +130,16 @@ const tileLayers = {};     // name → L.TileLayer
 const layerMeta = {};      // name → {res,ox,oy,w,h,ver}
 let curVers = {};          // name → 当前已挂载的版本
 
+function tileUrl(name, m) {
+  // 时间戳参数使每次请求的 URL 唯一，彻底绕开浏览器缓存——
+  // costmap 2Hz 更新必须拿到最新内容，不依赖任何缓存策略
+  return '/tile/' + name + '/{z}/{x}/{y}.png?v=' + m.ver + '_r13&t=' + Date.now();
+}
+
 function makeTileLayer(name, m) {
   // 所有图层的瓦片都在"全局地图网格"坐标系采样，bounds 统一用地图尺寸
   const bm = layerMeta.map || m;
-  const tl = L.tileLayer('/tile/' + name + '/{z}/{x}/{y}.png?v=' + m.ver + '_r11', {
+  const tl = L.tileLayer(tileUrl(name, m), {
     tileSize: 256,
     minZoom: -4,          // 关键修复：必须 ≤ 地图缩放级，否则图层直接不加载任何瓦片
     maxZoom: 6,
@@ -182,7 +188,8 @@ async function refreshLayout() {
         if (name === 'cg') tileLayers[name].setZIndex(200);
         if (name === 'cl') tileLayers[name].setZIndex(300);
       } else {
-        tileLayers[name].redraw();
+        // setUrl 换新 URL（带时间戳）会自动触发重取，浏览器缓存不可能命中
+        tileLayers[name].setUrl(tileUrl(name, m));
       }
     }
     if (name === 'map' && !inited) {

@@ -994,9 +994,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
                 self.send_header("Content-Length", str(len(png)))
-                # 地图层内容基本不变可长缓存；costmap 2Hz 更新需浏览器每次回源
-                self.send_header("Cache-Control",
-                                 "max-age=86400" if name == "map" else "no-cache")
+                self.send_header("Cache-Control", "max-age=3600")
                 self.end_headers()
                 self.wfile.write(png)
             else:
